@@ -14,27 +14,24 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"strconv"
 	"time"
 
-	"github.com/pingcap/tidb-operator/pkg/apis/pingcap/v1alpha1"
 	"github.com/pingcap/tidb-operator/tests"
 	"github.com/pingcap/tidb-operator/tests/pkg/apimachinery"
 	"github.com/pingcap/tidb-operator/tests/pkg/client"
-	"github.com/pingcap/tidb-operator/tests/pkg/fixture"
 	"github.com/pingcap/tidb-operator/tests/pkg/metrics"
 	"github.com/pingcap/tidb-operator/tests/slack"
 	"github.com/robfig/cron"
-	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/component-base/logs"
-	"k8s.io/klog"
-	"k8s.io/utils/pointer"
+	glog "k8s.io/klog"
 )
 
 var cfg *tests.Config
@@ -49,7 +46,7 @@ func main() {
 	logs.InitLogs()
 	defer logs.FlushLogs()
 	go func() {
-		klog.Info(http.ListenAndServe(":6060", nil))
+		glog.Info(http.ListenAndServe(":6060", nil))
 	}()
 	metrics.StartServer()
 	cfg = tests.ParseConfigOrDie()
@@ -91,8 +88,8 @@ func run() {
 
 	onePDCluster1 := newTidbClusterConfig("ns1", "one-pd-cluster-1")
 	onePDCluster2 := newTidbClusterConfig("ns2", "one-pd-cluster-2")
-	onePDCluster1.Clustrer.Spec.PD.Replicas = 1
-	onePDCluster2.Clustrer.Spec.PD.Replicas = 1
+	onePDCluster1.Resources["pd.replicas"] = "1"
+	onePDCluster2.Resources["pd.replicas"] = "1"
 
 	allClusters := []*tests.TidbClusterConfig{
 		cluster1,
@@ -127,74 +124,127 @@ func run() {
 	oa.CleanOperatorOrDie(ocfg)
 	oa.DeployOperatorOrDie(ocfg)
 
-	crdUtil := tests.NewCrdTestUtil(cli, kubeCli, asCli, false)
-	klog.Infof(fmt.Sprintf("allclusters: %v", allClusters))
-	crdUtil.CleanResourcesOrDie("tc", "ns1")
-	crdUtil.CleanResourcesOrDie("tc", "ns2")
-	crdUtil.CleanResourcesOrDie("pvc", "ns1")
-	crdUtil.CleanResourcesOrDie("pvc", "ns2")
-	crdUtil.CleanResourcesOrDie("secret", "ns1")
-	crdUtil.CleanResourcesOrDie("secret", "ns2")
-	crdUtil.CleanResourcesOrDie("pod", "ns1")
-	crdUtil.CleanResourcesOrDie("pod", "ns2")
+	for _, cluster := range allClusters {
+		oa.CleanTidbClusterOrDie(cluster)
+	}
 
 	caseFn := func(clusters []*tests.TidbClusterConfig, onePDClsuter *tests.TidbClusterConfig, backupTargets []tests.BackupTarget, upgradeVersion string) {
 		// check env
 		fta.CheckAndRecoverEnvOrDie()
 		oa.CheckK8sAvailableOrDie(nil, nil)
 
-		//deploy and clean the one-pd-cluster
-		onePDTC := onePDClsuter.Clustrer
-		crdUtil.CreateTidbClusterOrDie(onePDTC)
-		crdUtil.WaitTidbClusterReadyOrDie(onePDTC, 60*time.Minute)
-		crdUtil.DeleteTidbClusterOrDie(onePDTC)
+		// deploy and clean the one-pd-cluster
+		oa.DeployTidbClusterOrDie(onePDClsuter)
+		oa.CheckTidbClusterStatusOrDie(onePDClsuter)
+		oa.CleanTidbClusterOrDie(onePDClsuter)
 
 		// deploy
 		for _, cluster := range clusters {
-			tc := cluster.Clustrer
-			crdUtil.CreateTidbClusterOrDie(tc)
-			secret := buildSecret(cluster)
-			crdUtil.CreateSecretOrDie(secret)
+			oa.DeployTidbClusterOrDie(cluster)
 			addDeployedClusterFn(cluster)
 		}
 		for _, cluster := range clusters {
-			tc := cluster.Clustrer
-			crdUtil.WaitTidbClusterReadyOrDie(tc, 60*time.Minute)
-			crdUtil.CheckDisasterToleranceOrDie(tc)
-			oa.BeginInsertDataToOrDie(cluster)
+			oa.CheckTidbClusterStatusOrDie(cluster)
+			oa.CheckDisasterToleranceOrDie(cluster)
+			go oa.BeginInsertDataToOrDie(cluster)
 		}
-		klog.Infof("clusters deployed and checked")
-		slack.NotifyAndCompletedf("clusters deployed and checked, ready to run stability test")
+
+		// scale out
+		for _, cluster := range clusters {
+			cluster.ScaleTiDB(3).ScaleTiKV(5).ScalePD(5)
+			oa.ScaleTidbClusterOrDie(cluster)
+		}
+		for _, cluster := range clusters {
+			oa.CheckTidbClusterStatusOrDie(cluster)
+			oa.CheckDisasterToleranceOrDie(cluster)
+		}
+
+		// scale in
+		for _, cluster := range clusters {
+			cluster.ScaleTiDB(2).ScaleTiKV(3).ScalePD(3)
+			oa.ScaleTidbClusterOrDie(cluster)
+		}
+		for _, cluster := range clusters {
+			oa.CheckTidbClusterStatusOrDie(cluster)
+			oa.CheckDisasterToleranceOrDie(cluster)
+		}
 
 		// upgrade
 		namespace := os.Getenv("NAMESPACE")
 		oa.RegisterWebHookAndServiceOrDie(ocfg.WebhookConfigName, namespace, ocfg.WebhookServiceName, certCtx)
+		ctx, cancel := context.WithCancel(context.Background())
 		for _, cluster := range clusters {
-			cluster.Clustrer.Spec.Version = upgradeVersion
-			crdUtil.UpdateTidbClusterOrDie(cluster.Clustrer)
-			crdUtil.WaitTidbClusterReadyOrDie(cluster.Clustrer, 60*time.Minute)
+			assignedNodes := oa.GetTidbMemberAssignedNodesOrDie(cluster)
+			cluster.UpgradeAll(upgradeVersion)
+			oa.UpgradeTidbClusterOrDie(cluster)
+			oa.CheckUpgradeOrDie(ctx, cluster)
+			oa.CheckTidbClusterStatusOrDie(cluster)
+			oa.CheckTidbMemberAssignedNodesOrDie(cluster, assignedNodes)
 		}
-		klog.Infof("clusters upgraded in checked")
 
 		// configuration change
 		for _, cluster := range clusters {
-			cluster.Clustrer.Spec.PD.Replicas = int32(cfg.PDMaxReplicas)
-			grpcConcurrency := uint(cfg.TiKVGrpcConcurrency)
-			cluster.Clustrer.Spec.TiKV.Config.Server.GrpcConcurrency = &grpcConcurrency
-			tokenLimit := uint(cfg.TiDBTokenLimit)
-			cluster.Clustrer.Spec.TiDB.Config.TokenLimit = &tokenLimit
-			crdUtil.UpdateTidbClusterOrDie(cluster.Clustrer)
-			crdUtil.WaitTidbClusterReadyOrDie(cluster.Clustrer, 60*time.Minute)
+			// bad conf
+			cluster.TiDBPreStartScript = strconv.Quote("exit 1")
+			cluster.TiKVPreStartScript = strconv.Quote("exit 1")
+			cluster.PDPreStartScript = strconv.Quote("exit 1")
+			oa.UpgradeTidbClusterOrDie(cluster)
+			time.Sleep(30 * time.Second)
+			oa.CheckTidbClustersAvailableOrDie([]*tests.TidbClusterConfig{cluster})
+			// rollback conf
+			cluster.PDPreStartScript = strconv.Quote("")
+			cluster.TiKVPreStartScript = strconv.Quote("")
+			cluster.TiDBPreStartScript = strconv.Quote("")
+			oa.UpgradeTidbClusterOrDie(cluster)
+			// wait upgrade complete
+			oa.CheckUpgradeCompleteOrDie(cluster)
+			oa.CheckTidbClusterStatusOrDie(cluster)
+
+			cluster.UpdatePdMaxReplicas(cfg.PDMaxReplicas).
+				UpdateTiKVGrpcConcurrency(cfg.TiKVGrpcConcurrency).
+				UpdateTiDBTokenLimit(cfg.TiDBTokenLimit)
+			oa.UpgradeTidbClusterOrDie(cluster)
+			// wait upgrade complete
+			oa.CheckUpgradeOrDie(ctx, cluster)
+			oa.CheckTidbClusterStatusOrDie(cluster)
+
+			// scale have failed member tidb to zero replica
+			cluster.TiDBPreStartScript = strconv.Quote("exit 1")
+			oa.UpgradeTidbClusterOrDie(cluster)
+			time.Sleep(30 * time.Second)
+			// wait check fail members
+			oa.CheckTidbClusterHaveFailedMemberOrDie(cluster)
+			//scale tidb member to zero replica
+			cluster.ScaleTiDB(0)
+			oa.ScaleTidbClusterOrDie(cluster)
+			oa.CheckScaleTidbClusterToZeroReplicaOrDie(cluster)
+			//rollback conf
+			cluster.TiDBPreStartScript = strconv.Quote("")
+			cluster.ScaleTiDB(2)
+			oa.ScaleTidbClusterOrDie(cluster)
+
 		}
+		cancel()
 		oa.CleanWebHookAndServiceOrDie(ocfg.WebhookConfigName)
-		klog.Infof("clusters configurations updated in checked")
 
 		for _, cluster := range clusters {
-			crdUtil.CheckDisasterToleranceOrDie(cluster.Clustrer)
+			oa.CheckDisasterToleranceOrDie(cluster)
 		}
-		klog.Infof("clusters DisasterTolerance checked")
 
-		//stop node
+		// backup and restore
+		for i := range backupTargets {
+			oa.DeployTidbClusterOrDie(backupTargets[i].TargetCluster)
+			addDeployedClusterFn(backupTargets[i].TargetCluster)
+			oa.CheckTidbClusterStatusOrDie(backupTargets[i].TargetCluster)
+		}
+		oa.BackupAndRestoreToMultipleClustersOrDie(clusters[0], backupTargets)
+
+		// delete operator
+		oa.CleanOperatorOrDie(ocfg)
+		oa.CheckOperatorDownOrDie(deployedClusters)
+		oa.DeployOperatorOrDie(ocfg)
+
+		// stop node
 		physicalNode, node, faultTime := fta.StopNodeOrDie()
 		oa.EmitEvent(nil, fmt.Sprintf("StopNode: %s on %s", node, physicalNode))
 		oa.CheckFailoverPendingOrDie(deployedClusters, node, &faultTime)
@@ -202,23 +252,16 @@ func run() {
 		time.Sleep(3 * time.Minute)
 		fta.StartNodeOrDie(physicalNode, node)
 		oa.EmitEvent(nil, fmt.Sprintf("StartNode: %s on %s", node, physicalNode))
-		oa.WaitPodOnNodeReadyOrDie(deployedClusters, node)
 		oa.CheckRecoverOrDie(deployedClusters)
 		for _, cluster := range deployedClusters {
-			crdUtil.WaitTidbClusterReadyOrDie(cluster.Clustrer, 30*time.Minute)
+			oa.CheckTidbClusterStatusOrDie(cluster)
 		}
-		klog.Infof("clusters node stopped and restarted checked")
-		slack.NotifyAndCompletedf("stability test: clusters node stopped and restarted checked")
 
 		// truncate tikv sst file
 		oa.TruncateSSTFileThenCheckFailoverOrDie(clusters[0], 5*time.Minute)
-		klog.Infof("clusters truncate sst file and checked failover")
-		slack.NotifyAndCompletedf("stability test: clusters truncate sst file and checked failover")
 
 		// delete pd data
 		oa.DeletePDDataThenCheckFailoverOrDie(clusters[0], 5*time.Minute)
-		klog.Infof("cluster[%s/%s] DeletePDDataThenCheckFailoverOrDie success", clusters[0].Namespace, clusters[0].ClusterName)
-		slack.NotifyAndCompletedf("stability test: DeletePDDataThenCheckFailoverOrDie success")
 
 		// stop one etcd
 		faultEtcd := tests.SelectNode(cfg.ETCDs)
@@ -227,27 +270,23 @@ func run() {
 		time.Sleep(3 * time.Minute)
 		oa.CheckEtcdDownOrDie(ocfg, deployedClusters, faultEtcd)
 		fta.StartETCDOrDie(faultEtcd)
-		klog.Infof("clusters stop on etcd and restart")
 
 		// stop all etcds
 		fta.StopETCDOrDie()
 		time.Sleep(10 * time.Minute)
 		fta.StartETCDOrDie()
 		oa.CheckEtcdDownOrDie(ocfg, deployedClusters, "")
-		klog.Infof("clusters stop all etcd and restart")
 
 		// stop all kubelets
 		fta.StopKubeletOrDie()
 		time.Sleep(10 * time.Minute)
 		fta.StartKubeletOrDie()
 		oa.CheckKubeletDownOrDie(ocfg, deployedClusters, "")
-		klog.Infof("clusters stop all kubelets and restart")
 
 		// stop all kube-proxy and k8s/operator/tidbcluster is available
 		fta.StopKubeProxyOrDie()
 		oa.CheckKubeProxyDownOrDie(ocfg, clusters)
 		fta.StartKubeProxyOrDie()
-		klog.Infof("clusters stop all kube-proxy and restart")
 
 		// stop all kube-scheduler pods
 		for _, physicalNode := range cfg.APIServers {
@@ -261,7 +300,6 @@ func run() {
 				fta.StartKubeSchedulerOrDie(vNode.IP)
 			}
 		}
-		klog.Infof("clusters stop all kube-scheduler and restart")
 
 		// stop all kube-controller-manager pods
 		for _, physicalNode := range cfg.APIServers {
@@ -275,17 +313,14 @@ func run() {
 				fta.StartKubeControllerManagerOrDie(vNode.IP)
 			}
 		}
-		klog.Infof("clusters stop all kube-controller and restart")
 
 		// stop one kube-apiserver pod
 		faultApiServer := tests.SelectNode(cfg.APIServers)
-		klog.Infof("fault ApiServer Node name = %s", faultApiServer)
 		fta.StopKubeAPIServerOrDie(faultApiServer)
 		defer fta.StartKubeAPIServerOrDie(faultApiServer)
 		time.Sleep(3 * time.Minute)
 		oa.CheckOneApiserverDownOrDie(ocfg, clusters, faultApiServer)
 		fta.StartKubeAPIServerOrDie(faultApiServer)
-		klog.Infof("clusters stop one kube-apiserver and restart")
 
 		time.Sleep(time.Minute)
 		// stop all kube-apiserver pods
@@ -300,7 +335,6 @@ func run() {
 				fta.StartKubeAPIServerOrDie(vNode.IP)
 			}
 		}
-		klog.Infof("clusters stop all kube-apiserver and restart")
 		time.Sleep(time.Minute)
 	}
 
@@ -363,8 +397,7 @@ func run() {
 	}
 
 	slack.SuccessCount++
-	slack.NotifyAndCompletedf("Succeed stability onetime")
-	klog.Infof("################## Stability test finished at: %v\n\n\n\n", time.Now().Format(time.RFC3339))
+	glog.Infof("################## Stability test finished at: %v\n\n\n\n", time.Now().Format(time.RFC3339))
 }
 
 func newOperatorConfig() *tests.OperatorConfig {
@@ -394,10 +427,6 @@ func newOperatorConfig() *tests.OperatorConfig {
 func newTidbClusterConfig(ns, clusterName string) *tests.TidbClusterConfig {
 	tidbVersion := cfg.GetTiDBVersionOrDie()
 	topologyKey := "rack"
-	tc := fixture.GetTidbCluster(ns, clusterName, tidbVersion)
-	tc.Spec.PD.StorageClassName = pointer.StringPtr("local-storage")
-	tc.Spec.TiKV.StorageClassName = pointer.StringPtr("local-storage")
-	tc.Spec.ConfigUpdateStrategy = v1alpha1.ConfigUpdateStrategyRollingUpdate
 	return &tests.TidbClusterConfig{
 		Namespace:        ns,
 		ClusterName:      clusterName,
@@ -405,10 +434,9 @@ func newTidbClusterConfig(ns, clusterName string) *tests.TidbClusterConfig {
 		PDImage:          fmt.Sprintf("pingcap/pd:%s", tidbVersion),
 		TiKVImage:        fmt.Sprintf("pingcap/tikv:%s", tidbVersion),
 		TiDBImage:        fmt.Sprintf("pingcap/tidb:%s", tidbVersion),
-		PumpImage:        fmt.Sprintf("pingcap/tidb-binlog:%s", tidbVersion),
 		StorageClassName: "local-storage",
 		UserName:         "root",
-		Password:         "",
+		Password:         "admin",
 		InitSecretName:   fmt.Sprintf("%s-set-secret", clusterName),
 		BackupSecretName: fmt.Sprintf("%s-backup-secret", clusterName),
 		BackupName:       "backup",
@@ -429,7 +457,6 @@ func newTidbClusterConfig(ns, clusterName string) *tests.TidbClusterConfig {
 			"discovery.image":                cfg.OperatorImage,
 			"tikv.defaultcfBlockCacheSize":   "8GB",
 			"tikv.writecfBlockCacheSize":     "2GB",
-			"pvReclaimPolicy":                "Delete",
 		},
 		Args: map[string]string{
 			"binlog.drainer.workerCount": "1024",
@@ -440,21 +467,5 @@ func newTidbClusterConfig(ns, clusterName string) *tests.TidbClusterConfig {
 		TopologyKey:            topologyKey,
 		ClusterVersion:         tidbVersion,
 		EnableConfigMapRollout: true,
-		Clustrer:               tc,
 	}
-}
-
-func buildSecret(info *tests.TidbClusterConfig) *corev1.Secret {
-	backupSecret := corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      info.BackupSecretName,
-			Namespace: info.Namespace,
-		},
-		Data: map[string][]byte{
-			"user":     []byte(info.UserName),
-			"password": []byte(info.Password),
-		},
-		Type: corev1.SecretTypeOpaque,
-	}
-	return &backupSecret
 }
